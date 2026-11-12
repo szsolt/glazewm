@@ -279,7 +279,7 @@ Columns fill left-to-right. Say you have six windows open (one focused, five oth
 
 If the fixed columns can't hold every window and there's no `*` to absorb the rest, the extra windows stack onto the last column so none are dropped.
 
-**Column widths.** `center` sets the center column's width as a fraction of the workspace (`0.1`–`0.9`, default `0.6`). The rest of the width is split **equally** among the other columns, no matter how many windows each one stacks — so `C,*,*` at `center: 0.6` gives a 60% center and two 20% columns, while `2,C,*` gives a 60% center with 20% columns either side. Within a column, the stacked windows share its height evenly.
+**Column widths.** `center` sets the center column's width as a fraction of the workspace (`0.1`–`0.99`, default `0.6`). The rest of the width is split **equally** among the other columns, no matter how many windows each one stacks — so `C,*,*` at `center: 0.6` gives a 60% center and two 20% columns, while `2,C,*` gives a 60% center with 20% columns either side. Within a column, the stacked windows share its height evenly.
 
 **Per-workspace layout.** A workspace can pin its own layout via the `columns` property, reapplied automatically whenever the workspace is focused or its windows change:
 
@@ -318,7 +318,7 @@ general:
 
 | Command | Description |
 | --- | --- |
-| `columns [<spec>] [--center <fraction>] [--bias left\|right]` | Apply a one-shot layout to the focused workspace. Bare `columns` re-asserts the assigned layout; with no assignment it defaults to `*,C,*`. |
+| `columns [<spec>] [--center <fraction>[,<fraction>...]] [--bias left\|right]` | Apply a one-shot layout to the focused workspace. Bare `columns` re-asserts the assigned layout; with no assignment it defaults to `*,C,*`. Multiple `--center` values (e.g. `0.7,0.99`) cycle on each invocation. |
 | `assign-columns [<spec>] [--center <fraction>] [--bias left\|right]` | Assign a persistent layout to the focused workspace (equivalent to setting `columns` in the config). |
 | `unassign-columns` | Clear the workspace's assigned layout and return to normal tiling. |
 | `center` | Swap the focused window into the center column. Running it again swaps the previous center back. |
