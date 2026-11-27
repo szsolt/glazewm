@@ -18,7 +18,8 @@ jobs:
   build:
     uses: ./.github/workflows/build.yaml
     with:
-      enable_ui_access: true
+      # UIAccess needs a signed exe; only upstream has the signing secrets.
+      enable_ui_access: ${{ github.repository == 'glzr-io/glazewm' }}
       version_number: ${{ inputs.version_number }}
 
   package-windows:
@@ -62,6 +63,8 @@ jobs:
           path: out/installer-*
 
   package-macos:
+    # Needs Apple signing secrets, which only upstream has.
+    if: ${{ github.repository == 'glzr-io/glazewm' }}
     needs: build
     runs-on: macos-latest
     env:

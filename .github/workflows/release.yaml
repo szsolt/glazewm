@@ -40,7 +40,10 @@ jobs:
           mv installer-universal.exe "glazewm-$VERSION.exe"
           mv installer-arm64.msi "standalone-glazewm-$VERSION-arm64.msi"
           mv installer-x64.msi "standalone-glazewm-$VERSION-x64.msi"
-          mv installer-universal.dmg "glazewm-$VERSION.dmg"
+          # No macOS installer on forks without Apple signing secrets.
+          if [ -f installer-universal.dmg ]; then
+            mv installer-universal.dmg "glazewm-$VERSION.dmg"
+          fi
 
       - name: Create draft release
         env:
@@ -48,11 +51,17 @@ jobs:
           VERSION: v${{ inputs.version_number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          assets=(
+            "./glazewm-$VERSION.exe#$VERSION for Windows (standard)"
+            "./standalone-glazewm-$VERSION-arm64.msi#$VERSION for Windows (standalone, arm64)"
+            "./standalone-glazewm-$VERSION-x64.msi#$VERSION for Windows (standalone, x64)"
+          )
+          if [ -f "glazewm-$VERSION.dmg" ]; then
+            assets+=("./glazewm-$VERSION.dmg#$VERSION for macOS")
+          fi
+
           gh release create "$VERSION" \
             --title "$VERSION" \
             --generate-notes \
             --draft \
-            "./glazewm-$VERSION.exe#$VERSION for Windows (standard)" \
-            "./standalone-glazewm-$VERSION-arm64.msi#$VERSION for Windows (standalone, arm64)" \
-            "./standalone-glazewm-$VERSION-x64.msi#$VERSION for Windows (standalone, x64)" \
-            "./glazewm-$VERSION.dmg#$VERSION for macOS"
+            "${assets[@]}"
