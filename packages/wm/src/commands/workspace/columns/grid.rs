@@ -23,19 +23,27 @@ use crate::{
 /// This is the one place that knows how the declarative columns map onto
 /// the container tree: [`ColumnGrid::read`] lifts the tree into the grid
 /// and [`ColumnGrid::render`] rebuilds the tree from it. The commands
-/// operate purely on the grid in between, and the layout's center is
-/// defined here as the widest column (see [`ColumnGrid::center_index`]).
+/// operate purely on the grid in between. The layout's center is the
+/// column holding the workspace's recorded center window (see
+/// [`ColumnGrid::read`]).
 pub(super) struct ColumnGrid {
   /// Columns left-to-right, each a top-to-bottom stack of windows.
   pub columns: Vec<Vec<TilingWindow>>,
 
   /// Width fraction of each column, index-aligned with `columns`.
   pub widths: Vec<f32>,
+
+  /// Index of the `C` column, or `None` for a layout without a center.
+  pub center: Option<usize>,
 }
 
 impl ColumnGrid {
   /// Reads the workspace's top-level columns — each a top-to-bottom list
   /// of windows — paired with their current widths.
+  ///
+  /// The center is the column holding the window recorded by the last
+  /// render. Without a recorded window still in the workspace, it falls
+  /// back to a single strictly-widest column, if any.
   pub fn read(workspace: &Workspace) -> Self {
     let mut columns: Vec<Vec<TilingWindow>> = Vec::new();
     let mut widths: Vec<f32> = Vec::new();
@@ -61,7 +69,18 @@ impl ColumnGrid {
       }
     }
 
-    Self { columns, widths }
+    let recorded = workspace.center_window_id().and_then(|id| {
+      columns
+        .iter()
+        .position(|column| column.iter().any(|window| window.id() == id))
+    });
+    let center = recorded.or_else(|| strictly_widest(&widths));
+
+    Self {
+      columns,
+      widths,
+      center,
+    }
   }
 
   /// Total number of tiling windows across all columns.
@@ -69,41 +88,40 @@ impl ColumnGrid {
     self.columns.iter().map(Vec::len).sum()
   }
 
-  /// Index of the widest column, treated as the layout's center.
-  pub fn center_index(&self) -> usize {
-    (0..self.widths.len())
-      .max_by(|&a, &b| self.widths[a].total_cmp(&self.widths[b]))
-      .unwrap_or(0)
-  }
-
-  /// Whether the grid has a single strictly-widest column — the wide
-  /// center. Equal-width columns (a `C`-less layout) have no center, so
-  /// commands that act on the center (e.g. `center`) become no-ops.
-  pub fn has_center(&self) -> bool {
-    let Some(max) = self.widths.iter().copied().reduce(f32::max) else {
-      return false;
-    };
-    self
-      .widths
-      .iter()
-      .filter(|&&w| (max - w).abs() < 1e-4)
-      .count()
-      == 1
-  }
-
-  /// Id of the window in the center column's top slot, if the workspace
-  /// has any tiling windows.
+  /// Id of the window in the center column's top slot, if the layout has
+  /// a center.
   pub fn center_window_id(&self) -> Option<Uuid> {
     self
       .columns
-      .get(self.center_index())
+      .get(self.center?)
       .and_then(|col| col.first())
       .map(CommonGetters::id)
   }
 
-  /// Current width fraction of the center column, if present.
+  /// Current width fraction of the center column, if the layout has a
+  /// center.
   pub fn center_width(&self) -> Option<f32> {
-    self.widths.get(self.center_index()).copied()
+    self.widths.get(self.center?).copied()
+  }
+
+  /// Window to focus when the window with `id` closes: the next window in
+  /// its column, else the previous one, else the top of the nearest other
+  /// column (the left one on a tie).
+  pub fn neighbor_of(&self, id: Uuid) -> Option<TilingWindow> {
+    let (col, row) = self.find(id)?;
+    let column = &self.columns[col];
+
+    if let Some(window) = column
+      .get(row + 1)
+      .or_else(|| row.checked_sub(1).and_then(|above| column.get(above)))
+    {
+      return Some(window.clone());
+    }
+
+    (0..self.columns.len())
+      .filter(|&other| other != col && !self.columns[other].is_empty())
+      .min_by_key(|&other| (other.abs_diff(col), other))
+      .and_then(|other| self.columns[other].first().cloned())
   }
 
   /// `(column, row)` position of the window with `id`, if present.
@@ -118,6 +136,7 @@ impl ColumnGrid {
 
   /// Rebuilds `workspace` into these columns (left-to-right), sized to
   /// their widths. Empty columns are dropped and widths renormalised.
+  /// Records the center column's top window on the workspace.
   ///
   /// Uses only the existing tree primitives — `move_container_within_tree`
   /// to gather windows and `wrap_in_split_container` to form columns — so
@@ -130,6 +149,8 @@ impl ColumnGrid {
     state: &mut WmState,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
+    workspace.set_center_window_id(self.center_window_id());
+
     // Drop empty columns, pairing each surviving column with its width.
     let mut cols: Vec<Vec<TilingWindow>> = Vec::new();
     let mut fracs: Vec<f32> = Vec::new();
@@ -211,5 +232,21 @@ impl ColumnGrid {
       .queue_container_to_redraw(workspace_container);
 
     Ok(())
+  }
+}
+
+/// Index of the single strictly-widest column, if any. Equal-width columns
+/// (a `C`-less layout) have none.
+fn strictly_widest(widths: &[f32]) -> Option<usize> {
+  let max = widths.iter().copied().reduce(f32::max)?;
+  let mut widest = widths
+    .iter()
+    .enumerate()
+    .filter(|(_, &width)| (max - width).abs() < 1e-4)
+    .map(|(index, _)| index);
+
+  match (widest.next(), widest.next()) {
+    (Some(index), None) => Some(index),
+    _ => None,
   }
 }

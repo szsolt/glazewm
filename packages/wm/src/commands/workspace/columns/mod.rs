@@ -12,7 +12,7 @@ mod spec;
 
 use anyhow::Context;
 use uuid::Uuid;
-use wm_common::{ColumnBias, ColumnLayout};
+use wm_common::{ColumnBias, ColumnLayout, FocusAfterClose};
 use wm_platform::{Direction, Rect};
 
 use self::{
@@ -120,8 +120,14 @@ pub fn apply_columns(
   };
 
   let widths = column_widths(&kinds, clamp_center(center));
+  let center = kinds.iter().position(|k| matches!(k, ColumnKind::Center));
 
-  ColumnGrid { columns, widths }.render(workspace, state, config)
+  ColumnGrid {
+    columns,
+    widths,
+    center,
+  }
+  .render(workspace, state, config)
 }
 
 /// Assigns a column layout to the workspace and applies it immediately.
@@ -252,26 +258,57 @@ pub fn reapply_columns_after_move(
 }
 
 /// Id of the window currently in the workspace's center — the top of its
-/// widest column — if the workspace has any tiling windows. Capture this
+/// `C` column — if the layout has a center. Capture this
 /// before unmanaging a closing window so a follow-up
 /// `reapply_assigned_columns` can keep that window centered.
 pub fn workspace_center_window_id(workspace: &Workspace) -> Option<Uuid> {
   ColumnGrid::read(workspace).center_window_id()
 }
 
+/// Window to focus when `window` closes, when
+/// `general.columns_behavior.focus_after_close` asks for its neighbor in
+/// the column grid. Call before unmanaging the window.
+///
+/// Returns `None` to keep the default focus target: the setting is off,
+/// the window isn't focused, or its workspace has no effective columns.
+pub fn column_focus_after_close(
+  window: &WindowContainer,
+  state: &WmState,
+  config: &UserConfig,
+) -> anyhow::Result<Option<TilingWindow>> {
+  if config.value.general.columns_behavior.focus_after_close
+    != FocusAfterClose::Neighbor
+  {
+    return Ok(None);
+  }
+
+  let WindowContainer::TilingWindow(tiling) = window else {
+    return Ok(None);
+  };
+
+  let is_focused = state
+    .focused_container()
+    .is_some_and(|focused| focused.id() == tiling.id());
+
+  let Some(workspace) = tiling.workspace() else {
+    return Ok(None);
+  };
+
+  if !is_focused || effective_columns(&workspace, config)?.is_none() {
+    return Ok(None);
+  }
+
+  Ok(ColumnGrid::read(&workspace).neighbor_of(tiling.id()))
+}
+
 /// On-screen rect of the workspace's wide center window — the top of its
-/// widest column — or `None` when the layout has no center (equal-width
-/// columns, or fewer than two windows). Capture this before a drag drops a
+/// `C` column — or `None` when the layout has no center. Capture this
+/// before a drag drops a
 /// window back into tiling so the follow-up reapply can tell whether the
 /// drop landed on the center band and should take it over.
 pub fn workspace_center_rect(workspace: &Workspace) -> Option<Rect> {
   let grid = ColumnGrid::read(workspace);
-  if !grid.has_center() {
-    return None;
-  }
-
-  let center = grid.center_index();
-  grid.columns.get(center)?.first()?.to_rect().ok()
+  grid.columns.get(grid.center?)?.first()?.to_rect().ok()
 }
 
 /// Remembers the window leaving the center as the `center` command's
@@ -298,8 +335,8 @@ fn remember_outgoing_center(
   }
 }
 
-/// Current width fraction of the workspace's center column — its widest
-/// column — when it has a laid-out columns of at least two tiling windows.
+/// Current width fraction of the workspace's center column when it has a
+/// laid-out center and at least two tiling windows.
 ///
 /// Returns `None` for a workspace with fewer than two tiling windows,
 /// where no meaningful center width exists.
@@ -405,8 +442,11 @@ pub fn apply_rotate(
 
   // Windows loop clockwise around the center column: the columns left of
   // center are traversed bottom-to-top (so `ring_slots` lists them
-  // reversed), then the center and right columns top-to-bottom.
-  let center = grid.center_index();
+  // reversed), then the center and right columns top-to-bottom. A layout
+  // without a center pivots on its last column.
+  let center = grid
+    .center
+    .unwrap_or_else(|| grid.columns.len().saturating_sub(1));
 
   let mut ring_slots: Vec<(usize, usize)> = Vec::new();
   for (col, column) in grid.columns.iter().enumerate().take(center) {
@@ -459,6 +499,7 @@ pub fn apply_rotate(
   ColumnGrid {
     columns,
     widths: grid.widths,
+    center: grid.center,
   }
   .render(workspace, state, config)?;
 
@@ -469,7 +510,7 @@ pub fn apply_rotate(
   Ok(())
 }
 
-/// Swaps a window into the center slot — the top of the widest column.
+/// Swaps a window into the center slot — the top of the `C` column.
 ///
 /// When the focused window is *not* the center, it swaps into the center
 /// and the old center takes its place; focus follows into the center. When
@@ -496,11 +537,10 @@ pub fn apply_center(
 
   // Equal-width columns (a `C`-less layout) have no wide center to swap
   // into, so `center` is a no-op there.
-  if !grid.has_center() {
+  let Some(center) = grid.center else {
     return Ok(());
-  }
+  };
 
-  let center = grid.center_index();
   if grid.columns[center].is_empty() {
     return Ok(());
   }
@@ -659,13 +699,14 @@ mod tests {
 
   use super::{
     apply_center, apply_columns, apply_rotate, assign_columns,
-    effective_columns, focused_window_id, grid::ColumnGrid,
-    move_window_in_columns, reapply_assigned_columns, store_center_width,
-    unassign_columns, workspace_center_window_id,
+    column_focus_after_close, effective_columns, focused_window_id,
+    grid::ColumnGrid, move_window_in_columns, reapply_assigned_columns,
+    store_center_width, unassign_columns, workspace_center_window_id,
   };
   use crate::{
     commands::{
       container::{attach_container, focus_container_by_id},
+      window::unmanage_window,
       workspace::move_workspace_in_direction,
     },
     models::{
@@ -816,7 +857,7 @@ mod tests {
     );
 
     let grid = ColumnGrid::read(&workspace);
-    assert_eq!(grid.center_index(), 1);
+    assert_eq!(grid.center, Some(1));
     assert!((grid.center_width().unwrap() - 0.6).abs() < 1e-3);
     assert!((grid.widths[0] - 0.2).abs() < 1e-3);
     assert!((grid.widths[2] - 0.2).abs() < 1e-3);
@@ -851,7 +892,7 @@ mod tests {
     );
 
     let grid = ColumnGrid::read(&workspace);
-    assert_eq!(grid.center_index(), 1);
+    assert_eq!(grid.center, Some(1));
     assert!((grid.center_width().unwrap() - 0.6).abs() < 1e-3);
     assert!((grid.widths[0] - 0.2).abs() < 1e-3);
     assert!((grid.widths[2] - 0.2).abs() < 1e-3);
@@ -882,7 +923,7 @@ mod tests {
     );
 
     let grid = ColumnGrid::read(&workspace);
-    assert!(!grid.has_center());
+    assert_eq!(grid.center, None);
     assert!((grid.widths[0] - 0.5).abs() < 1e-3);
     assert!((grid.widths[1] - 0.5).abs() < 1e-3);
   }
@@ -1353,7 +1394,7 @@ mod tests {
     assert!(workspace.config().columns.is_none());
   }
 
-  /// The center window id is the top of the widest column.
+  /// The center window id is the top of the `C` column.
   #[test]
   fn reports_center_window_id() {
     let (mut state, workspace, windows) = setup(5);
@@ -1403,5 +1444,142 @@ mod tests {
 
     let stored = workspace.config().columns.unwrap().center;
     assert!((stored - 0.7).abs() < 1e-3);
+  }
+
+  /// A center narrower than its side columns is still found as the
+  /// center, so center commands and width cycling act on the right
+  /// window.
+  #[test]
+  fn narrow_center_is_still_the_center() {
+    let (mut state, workspace, windows) = setup(3);
+    let config = mock_user_config();
+    let ids = windows.iter().map(CommonGetters::id).collect::<Vec<_>>();
+
+    apply_columns(
+      &workspace,
+      "*,C,*",
+      0.2,
+      &ColumnBias::Left,
+      Some(ids[1]),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    let grid = ColumnGrid::read(&workspace);
+    assert_eq!(grid.center, Some(1));
+    assert!((grid.center_width().unwrap() - 0.2).abs() < 1e-3);
+    assert_eq!(workspace_center_window_id(&workspace), Some(ids[1]));
+
+    // `center` swaps the focused side window into the narrow center.
+    focus_container_by_id(&ids[0], &mut state).unwrap();
+    apply_center(&workspace, &mut state, &config).unwrap();
+    assert_eq!(
+      id_grid(&workspace),
+      vec![vec![ids[1]], vec![ids[0]], vec![ids[2]]]
+    );
+    assert_eq!(workspace_center_window_id(&workspace), Some(ids[0]));
+  }
+
+  /// Closing a side window re-tidies the rest in their existing order,
+  /// keeping the center in place.
+  #[test]
+  fn closing_a_window_keeps_window_order() {
+    let (mut state, workspace, windows) = setup(6);
+    let config = config_with_default_columns("*,C,*");
+    let ids = windows.iter().map(CommonGetters::id).collect::<Vec<_>>();
+
+    apply_columns(
+      &workspace,
+      "*,C,*",
+      0.6,
+      &ColumnBias::Left,
+      Some(ids[2]),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+    assert_eq!(
+      id_grid(&workspace),
+      vec![
+        vec![ids[0], ids[1], ids[3]],
+        vec![ids[2]],
+        vec![ids[4], ids[5]],
+      ]
+    );
+
+    for closed in [1, 4] {
+      let center = workspace_center_window_id(&workspace);
+      unmanage_window(windows[closed].clone().into(), &mut state).unwrap();
+      reapply_assigned_columns(&workspace, center, &mut state, &config)
+        .unwrap();
+    }
+
+    assert_eq!(
+      id_grid(&workspace),
+      vec![vec![ids[0], ids[3]], vec![ids[2]], vec![ids[5]]]
+    );
+  }
+
+  /// The close neighbor is the next window in the column, else the one
+  /// above, else the top of the nearest column (left on a tie).
+  #[test]
+  fn finds_neighbor_of_closing_window() {
+    let (mut state, workspace, windows) = setup(5);
+    let config = mock_user_config();
+    let ids = windows.iter().map(CommonGetters::id).collect::<Vec<_>>();
+
+    apply_columns(
+      &workspace,
+      "*,C,*",
+      0.6,
+      &ColumnBias::Left,
+      Some(ids[2]),
+      &mut state,
+      &config,
+    )
+    .unwrap();
+
+    let grid = ColumnGrid::read(&workspace);
+    let neighbor =
+      |index: usize| grid.neighbor_of(ids[index]).map(|w| w.id());
+    assert_eq!(neighbor(0), Some(ids[1]));
+    assert_eq!(neighbor(1), Some(ids[0]));
+    assert_eq!(neighbor(2), Some(ids[0]));
+    assert_eq!(neighbor(4), Some(ids[3]));
+  }
+
+  /// `focus_after_close: neighbor` picks the grid neighbor of the focused
+  /// window, and leaves unfocused windows and the default setting alone.
+  #[test]
+  fn focus_after_close_follows_setting() {
+    let (mut state, workspace, windows) = setup(5);
+    let ids = windows.iter().map(CommonGetters::id).collect::<Vec<_>>();
+    let yaml = "general:\n  default_columns:\n    - min_aspect_ratio: 1.5\n      spec: '*,C,*'\n  columns_behavior:\n    focus_after_close: neighbor\n";
+    let neighbor_config =
+      UserConfig::mock(serde_yaml::from_str(yaml).unwrap());
+    let default_config = config_with_default_columns("*,C,*");
+
+    apply_columns(
+      &workspace,
+      "*,C,*",
+      0.6,
+      &ColumnBias::Left,
+      Some(ids[2]),
+      &mut state,
+      &neighbor_config,
+    )
+    .unwrap();
+    focus_container_by_id(&ids[3], &mut state).unwrap();
+
+    let target = |index: usize, config: &UserConfig| {
+      let window = WindowContainer::TilingWindow(windows[index].clone());
+      column_focus_after_close(&window, &state, config)
+        .unwrap()
+        .map(|w| w.id())
+    };
+    assert_eq!(target(3, &neighbor_config), Some(ids[4]));
+    assert_eq!(target(0, &neighbor_config), None);
+    assert_eq!(target(3, &default_config), None);
   }
 }
