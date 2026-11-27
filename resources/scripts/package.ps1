@@ -31,7 +31,8 @@ function SignFiles() {
   )
 
   foreach ($secret in $secrets) {
-    if (!(Test-Path "env:$secret")) {
+    # Actions passes unset secrets as empty strings, so check for a value.
+    if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($secret))) {
       Write-Output "Skipping signing due to missing secret '$secret'."
       Return
     }
